@@ -1,85 +1,139 @@
-#!/bin/bash
+#!/usr/bin/env bash
+set -euxo pipefail
 
-# Execute on Both "Master" & "Worker" Nodes:
+# 0. Preflight: run as root
+if [ "$EUID" -ne 0 ]; then
+  echo "⚠️  Please run as root or via sudo!"
+  exit 1
+fi
 
-# 1. Disable Swap: Required for Kubernetes to function correctly.
-echo "Disabling swap..."
-sudo swapoff -a
-sleep 2
+# 1. Disable swap
+echo "[1] Disabling swap..."
+swapoff -a
+sed -i '/ swap / s/^/#/' /etc/fstab
 
-# 2. Load Necessary Kernel Modules: Required for Kubernetes networking.
-echo "Loading necessary kernel modules for Kubernetes networking..."
-cat <<EOF | sudo tee /etc/modules-load.d/k8s.conf
+# 2. Load kernel modules
+echo "[2] Loading kernel modules..."
+cat <<EOF >/etc/modules-load.d/k8s.conf
 overlay
 br_netfilter
 EOF
+modprobe overlay
+modprobe br_netfilter
 
-sudo modprobe overlay
-sudo modprobe br_netfilter
-sleep 2
-
-# 3. Set Sysctl Parameters: Helps with networking.
-echo "Setting sysctl parameters for networking..."
-cat <<EOF | sudo tee /etc/sysctl.d/k8s.conf
+# 3. Sysctl params
+echo "[3] Applying sysctl settings..."
+cat <<EOF >/etc/sysctl.d/99-k8s.conf
 net.bridge.bridge-nf-call-iptables  = 1
 net.bridge.bridge-nf-call-ip6tables = 1
 net.ipv4.ip_forward                 = 1
 EOF
+sysctl --system
 
-sudo sysctl --system
-lsmod | grep br_netfilter
-lsmod | grep overlay
-sleep 2
+# 4. Install basic prerequisites
+echo "[4] Installing prerequisites..."
+apt-get update
+apt-get install -y \
+  apt-transport-https \
+  ca-certificates \
+  curl \
+  gnupg \
+  lsb-release \
+  software-properties-common \
+  git \
+  unzip \
+  wget \
+  jq
 
-# 4. Install Containerd:
-echo "Installing containerd..."
-sudo apt-get update
-sleep 2
+# 5. Install Docker CE + containerd
+echo "[5] Installing Docker and containerd..."
+install -m0755 -d /etc/apt/keyrings
+curl -fsSL https://download.docker.com/linux/ubuntu/gpg \
+  | gpg --dearmor -o /etc/apt/keyrings/docker.gpg
+echo \
+  "deb [arch=$(dpkg --print-architecture) \
+  signed-by=/etc/apt/keyrings/docker.gpg] \
+  https://download.docker.com/linux/ubuntu \
+  $(lsb_release -cs) stable" \
+  > /etc/apt/sources.list.d/docker.list
+apt-get update
+apt-get install -y docker-ce docker-ce-cli containerd.io
+cat <<EOF >/etc/containerd/config.toml
+$(containerd config default | sed 's/SystemdCgroup = false/SystemdCgroup = true/')
+EOF
+systemctl restart containerd
+systemctl enable containerd docker
 
-sudo apt-get install -y ca-certificates curl
-sleep 2
+# 6. Install Kubernetes components
+echo "[6] Installing kubelet, kubeadm, kubectl..."
+curl -fsSL https://pkgs.k8s.io/core:/stable:/v1.29/deb/Release.key \
+  | gpg --dearmor -o /etc/apt/keyrings/k8s.gpg
+echo "deb [signed-by=/etc/apt/keyrings/k8s.gpg] \
+  https://pkgs.k8s.io/core:/stable:/v1.29/deb/ ./" \
+  > /etc/apt/sources.list.d/kubernetes.list
+apt-get update
+apt-get install -y kubelet kubeadm kubectl
+apt-mark hold kubelet kubeadm kubectl
+systemctl enable kubelet
 
-sudo install -m 0755 -d /etc/apt/keyrings
-sudo curl -fsSL https://download.docker.com/linux/ubuntu/gpg -o /etc/apt/keyrings/docker.asc
-sudo chmod a+r /etc/apt/keyrings/docker.asc
-sleep 2
+# 7. Open firewall ports via UFW
+echo "[7] Configuring UFW firewall..."
+ufw --force reset
+ufw default deny incoming
+ufw default allow outgoing
+for port in \
+  22 \
+  80 443 \
+  6443 2379:2380 10250 10251 10252 30000:32767 \
+  8080 9000; do
+  ufw allow $port/tcp
+done
+ufw --force enable
 
-echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.asc] https://download.docker.com/linux/ubuntu $(. /etc/os-release && echo \"$VERSION_CODENAME\") stable" | sudo tee /etc/apt/sources.list.d/docker.list > /dev/null
+# 8. Install Java, Maven
+echo "[8] Installing Java 17, Maven..."
+apt-get install -y openjdk-17-jdk maven
 
-sudo apt-get update
-sleep 2
+# 9. Install Jenkins
+echo "[9] Installing Jenkins..."
+curl -fsSL https://pkg.jenkins.io/debian-stable/jenkins.io-2023.key \
+  | gpg --dearmor -o /usr/share/keyrings/jenkins-keyring.gpg
+echo "deb [signed-by=/usr/share/keyrings/jenkins-keyring.gpg] \
+  https://pkg.jenkins.io/debian-stable binary/" \
+  > /etc/apt/sources.list.d/jenkins.list
+apt-get update
+apt-get install -y jenkins
+systemctl enable jenkins
 
-sudo apt-get install -y containerd.io
-sleep 2
+# 10. Install SonarQube
+echo "[10] Installing SonarQube..."
+cd /opt
+wget -q https://binaries.sonarsource.com/CommercialDistribution/sonarqube/sonarqube-10.2.0.72605.zip
+unzip -q sonarqube-10.2.0.72605.zip
+ln -s sonarqube-10.2.0.72605 sonarqube
+useradd --no-create-home --shell /usr/sbin/nologin sonar
+chown -R sonar:sonar sonarqube-10.2.0.72605
 
-containerd config default | sed -e 's/SystemdCgroup = false/SystemdCgroup = true/' -e 's/sandbox_image = "registry.k8s.io\/pause:3.6"/sandbox_image = "registry.k8s.io\/pause:3.9"/' | sudo tee /etc/containerd/config.toml
+cat <<EOF >/etc/systemd/system/sonarqube.service
+[Unit]
+Description=SonarQube service
+After=network.target
 
-sudo systemctl restart containerd
-sleep 2
+[Service]
+Type=forking
+ExecStart=/opt/sonarqube/bin/linux-x86-64/sonar.sh start
+ExecStop=/opt/sonarqube/bin/linux-x86-64/sonar.sh stop
+User=sonar
+Group=sonar
+Restart=always
+LimitNOFILE=65536
 
-sudo systemctl is-active containerd
-sleep 2
+[Install]
+WantedBy=multi-user.target
+EOF
 
-# 5. Install Kubernetes Components:
-echo "Installing Kubernetes components (kubelet, kubeadm, kubectl)..."
-sudo apt-get update
-sleep 2
+systemctl daemon-reload
+systemctl enable sonarqube
+systemctl start sonarqube
 
-sudo apt-get install -y apt-transport-https ca-certificates curl gpg
-sleep 2
-
-curl -fsSL https://pkgs.k8s.io/core:/stable:/v1.29/deb/Release.key | sudo gpg --dearmor -o /etc/apt/keyrings/kubernetes-apt-keyring.gpg
-sleep 2
-
-echo 'deb [signed-by=/etc/apt/keyrings/kubernetes-apt-keyring.gpg] https://pkgs.k8s.io/core:/stable:/v1.29/deb/ /' | sudo tee /etc/apt/sources.list.d/kubernetes.list
-
-sudo apt-get update
-sleep 2
-
-sudo apt-get install -y kubelet kubeadm kubectl
-sleep 2
-
-sudo apt-mark hold kubelet kubeadm kubectl
-sleep 2
-
-echo "Kubernetes setup completed."
+echo "✅ Bootstrap complete!"
